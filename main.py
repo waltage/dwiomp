@@ -18,6 +18,6 @@ model.variable("feature", base_df["feature"], VarType.Unit, "INC", "FEATURE")
 
 model.run()
 
-model.decomp()
 
+print(model.results["summary"])
 model.decomp_df.to_csv("./testdecomp.csv")

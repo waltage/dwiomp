@@ -13,12 +13,12 @@ class VarType(Enum):
 class Model(object):
     def __init__(self, name):
         self.name = name
-        self.ds = pd.DataFrame()
-        self.cols = 0
-        self.metas = list()
-        self.subjects = list()
-        self.depvar = None
-        self.vars = dict()
+        self.original_df = pd.DataFrame()
+        self.n_cols = 0
+        self.meta_vars = list()
+        self.subject_vars = list()
+        self.dependent_var = None
+        self.model_vars = dict()
 
         self.means = pd.DataFrame()
         self.model_df = pd.DataFrame()
@@ -30,6 +30,7 @@ class Model(object):
             pred=None,
         )
         self.decomp_df = pd.DataFrame()
+        self._wide_decomp_df = pd.DataFrame()
 
     def _rename_var(self, name, type=None, bucket=None, detail=None):
         _name = name.replace(" ", "").lower()
@@ -45,8 +46,8 @@ class Model(object):
         return varname
 
     def _add_series(self, var, series):
-        self.ds.insert(self.cols, var, series)
-        self.cols += 1
+        self.original_df.insert(self.n_cols, var, series)
+        self.n_cols += 1
 
     @staticmethod
     def _log(series):
@@ -55,48 +56,48 @@ class Model(object):
     def meta(self, var, series):
         varname = "meta|" + self._rename_var(var)
         self._add_series(varname, series)
-        self.metas.append(varname)
+        self.meta_vars.append(varname)
 
     def subject(self, var, series):
         varname = "subj|" + self._rename_var(var)
         self._add_series(varname, series)
-        self.subjects.append(varname)
+        self.subject_vars.append(varname)
 
     def dependent(self, var, series):
         varname = "depvar|" + self._rename_var(var, VarType.Log)
         _series = self._log(series)
         self._add_series(varname, _series)
-        self.depvar = varname
+        self.dependent_var = varname
 
     def variable(self, var, series, vartype, bucket=None, detail=None):
         varname = "var|" + self._rename_var(var, vartype)
         if vartype == VarType.Log:
             self._add_series(varname, self._log(series))
-            self.vars[varname] = (vartype, bucket, detail)
+            self.model_vars[varname] = (vartype, bucket, detail)
         elif vartype == VarType.Class:
             pfx = varname + "|"
             _d = pd.get_dummies(series, pfx)
             for k in _d:
                 self._add_series(k, _d[k])
-                self.vars[k] = (vartype, bucket, detail)
+                self.model_vars[k] = (vartype, bucket, detail)
         else:
             self._add_series(varname, series)
-            self.vars[varname] = (vartype, bucket, detail)
+            self.model_vars[varname] = (vartype, bucket, detail)
 
     def center(self):
-        self.model_df = self.ds
+        self.model_df = self.original_df
         vars = list()
-        vars.append(self.depvar)
-        for _ in self.vars.keys():
+        vars.append(self.dependent_var)
+        for _ in self.model_vars.keys():
             vars.append(_)
 
         aggkeys = dict()
         for _ in vars:
             aggkeys["mean_"+_] = (_, "mean")
 
-        if self.subjects:
-            self.means = self.model_df.groupby(self.subjects).agg(**aggkeys)
-            self.model_df = self.model_df.merge(self.means, on=self.subjects)
+        if self.subject_vars:
+            self.means = self.model_df.groupby(self.subject_vars).agg(**aggkeys)
+            self.model_df = self.model_df.merge(self.means, on=self.subject_vars)
         else:
             self.model_df["_zz"] = 1
             self.means = self.model_df.groupby("_zz").agg(**aggkeys)
@@ -111,8 +112,8 @@ class Model(object):
     def run(self):
         self.center()
 
-        X = self.model_df[self.vars.keys()]
-        Y = self.model_df[self.depvar]
+        X = self.model_df[list(self.model_vars.keys())]
+        Y = self.model_df[self.dependent_var]
         model = sm.OLS(Y, X)
         result = model.fit()
 
@@ -125,84 +126,140 @@ class Model(object):
         self.results["pred"] = result.fittedvalues
         self.results["full"] = result
 
-    def decomp(self):
-        self.decomp_df["ACTUAL"] = np.exp(self.ds[self.depvar])
-        self.decomp_df["mult_resid"] = np.exp(self.results["resid"])
+        self.decomp()
 
-        all_vars = list(self.results["coefs"].keys())
-        all_vars.append("resid")
+    def decomp(self):
+        _wide_decomp = pd.DataFrame()
+        for _ in self.meta_vars:
+            _wide_decomp[_] = self.original_df[_]
+
+        for _ in self.subject_vars:
+            _wide_decomp[_] = self.original_df[_]
+
+        _wide_decomp["ACTUAL"] = np.exp(self.original_df[self.dependent_var])
+        _wide_decomp["APE"] = np.abs(np.exp(self.results["resid"]) - 1)
+        _wide_decomp["mult_resid"] = np.exp(self.results["resid"])
+
+        dec_vars = list(self.results["coefs"].keys())
+        dec_vars.append("resid")
 
         for k, v in self.results["coefs"].items():
-            if self.vars[k][0] == VarType.Log:
+            if self.model_vars[k][0] == VarType.Log:
                 # Val is exp(val + Mean)
                 # Ref is the exp(Mean)
                 val = np.exp(self.model_df[k] + self.model_df["mean_" + k])
                 ref = np.exp(self.model_df["mean_" + k])
-                self.decomp_df["mult_" + k] = (val / ref)**(v)
+                _wide_decomp["mult_" + k] = (val / ref)**(v)
             else:
                 # Val is val + Mean
                 # Ref is 0
                 val = self.model_df[k] + self.model_df["mean_" + k]
-                self.decomp_df["mult_" + k] = np.exp(val * v)
+                _wide_decomp["mult_" + k] = np.exp(val * v)
 
-        small_base = list()
-        pos_vols = list()
-        neg_vols = list()
-        var_vols = dict()
+        nc_reference_base_vol = list()
+        nc_posvol = list()
+        nc_negvol = list()
+        nc_dec_var_vol = dict()
 
-        for v in all_vars:
-            var_vols[v] = list()
+        for v in dec_vars:
+            nc_dec_var_vol[v] = list()
 
-        for row in self.decomp_df.to_dict(orient="records"):
-            mult_pos = 1
-            mult_neg = 1
+        for row in _wide_decomp.to_dict(orient="records"):
+            positive_multipliers = 1
+            negative_multipliers = 1
 
-            pos_var = dict()
-            neg_var = dict()
+            positive_vars_magnitude = dict()
+            negative_vars_magnitude = dict()
 
-            for var in all_vars:
+            for var in dec_vars:
                 m = row["mult_" + var]
                 if m > 1:
-                    mult_pos *= m
-                    pos_var["mult_" + var] = m - 1
+                    positive_multipliers *= m
+                    positive_vars_magnitude["mult_" + var] = m - 1
                 elif m < 1:
-                    mult_neg *= m
-                    neg_var["mult_" + var] = m - 1
+                    negative_multipliers *= m
+                    negative_vars_magnitude["mult_" + var] = m - 1
 
-            mult_total = mult_pos * mult_neg
-            smallb = row["ACTUAL"] / mult_total
+            total_multiplier = positive_multipliers * negative_multipliers
+            reference_base_vol = row["ACTUAL"] / total_multiplier
 
-            small_base.append(smallb)
+            nc_reference_base_vol.append(reference_base_vol)
 
 
-            syn_a = mult_pos - 1
-            syn_b = -1 * (mult_neg - 1)
-            syn_ab = syn_a * syn_b
+            synergy_pos_comp = positive_multipliers - 1
+            synergy_neg_comp = -1 * (negative_multipliers - 1)
+            synergy_comb_comp = synergy_pos_comp * synergy_neg_comp
 
-            pos_vol = smallb * syn_a
-            neg_vol = smallb * -1 * (syn_b + syn_ab)
+            pos_vol = reference_base_vol * synergy_pos_comp
+            neg_vol = reference_base_vol * -1 * (synergy_neg_comp +
+                                                 synergy_comb_comp)
 
-            pos_vols.append(pos_vol)
-            neg_vols.append(neg_vol)
+            nc_posvol.append(pos_vol)
+            nc_negvol.append(neg_vol)
 
-            psum = sum(pos_var.values())
-            nsum = sum(neg_var.values())
+            psum = sum(positive_vars_magnitude.values())
+            nsum = sum(negative_vars_magnitude.values())
 
-            for v in all_vars:
+            for v in dec_vars:
                 name = "mult_" + v
-                if name in pos_var:
-                    _v = pos_var[name] / psum * pos_vol
-                    var_vols[v].append(_v)
-                elif name in neg_var:
-                    _v = neg_var[name] / nsum * neg_vol
-                    var_vols[v].append(_v)
+                if name in positive_vars_magnitude:
+                    _v = positive_vars_magnitude[name] / psum * pos_vol
+                    nc_dec_var_vol[v].append(_v)
+                elif name in negative_vars_magnitude:
+                    _v = negative_vars_magnitude[name] / nsum * neg_vol
+                    nc_dec_var_vol[v].append(_v)
                 else:
-                    var_vols[v].append(0)
+                    nc_dec_var_vol[v].append(0)
 
-        self.decomp_df["small_base"] = np.array(small_base)
-        self.decomp_df["pos_vols"] = np.array(pos_vols)
-        self.decomp_df["neg_vols"] = np.array(neg_vols)
+        _wide_decomp["decvol_small_base"] = np.array(nc_reference_base_vol)
+        _wide_decomp["pos_vols"] = np.array(nc_posvol)
+        _wide_decomp["neg_vols"] = np.array(nc_negvol)
 
-        for v in var_vols:
-            self.decomp_df["decvol_"+v] = np.array(var_vols[v])
+        for v in nc_dec_var_vol:
+            _wide_decomp["decvol_"+v] = np.array(nc_dec_var_vol[v])
 
+        self._wide_decomp_df = _wide_decomp
+
+        _long_obs = list()
+        _long_cols = list()
+        _long_cols.append("MODEL_NAME")
+
+        for _ in self.meta_vars:
+            _long_cols.append(_)
+
+        for _ in self.subject_vars:
+            _long_cols.append(_)
+
+        _long_cols.append("BUCKET")
+        _long_cols.append("DETAIL")
+        _long_cols.append("VARIABLE")
+        _long_cols.append("DECOMPOSED_VOLUME")
+
+        dec_vars.append("small_base")
+
+        for row in _wide_decomp.to_dict(orient="records"):
+
+            for dc in dec_vars:
+                record = list()
+                record.append(self.name)
+                for _ in self.meta_vars:
+                    record.append(row[_])
+                for _ in self.subject_vars:
+                    record.append(row[_])
+                if dc == "resid":
+                    record.append("BASE")
+                    record.append("UNEXPLAINED")
+                elif dc == "small_base":
+                    record.append("BASE")
+                    record.append("REFERENCE")
+                else:
+                    record.append(self.model_vars[dc][1])
+                    record.append(self.model_vars[dc][2])
+                record.append(dc)
+                record.append(row["decvol_"+dc])
+
+                _long_obs.append(tuple(record))
+
+        self.decomp_df = pd.DataFrame(_long_obs, columns=_long_cols)
+
+        print(self.decomp_df)
